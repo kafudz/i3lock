@@ -16,11 +16,38 @@ project(
   # Ubuntu 18.04 (supported until 2023) has meson 0.45.
   # We can revisit our minimum supported meson version
   # if it turns out to be too hard to maintain.
-  meson_version: '>=0.45.0',
+  meson_version: '>=0.46.0',
 )
 
 cc = meson.get_compiler('c')
-add_project_arguments(cc.get_supported_arguments(['-Wunused-value']), language: 'c')
+add_project_arguments(cc.get_supported_arguments([
+  '-Wunused-value',
+  '-Wformat=2',
+  '-Wformat-security',
+  '-Werror=format-security',
+  '-Wstrict-prototypes',
+  '-Wmissing-prototypes',
+  '-Wpointer-arith',
+  '-Wno-unused-parameter',
+]), language: 'c')
+
+# Hardening flags. get_supported_* keeps the build portable to platforms where
+# a particular flag is not available.
+add_project_arguments(cc.get_supported_arguments([
+  '-fstack-protector-strong',
+  '-fPIE',
+]), language: 'c')
+add_project_link_arguments(cc.get_supported_link_arguments([
+  '-pie',
+  '-Wl,-z,relro',
+  '-Wl,-z,now',
+]), language: 'c')
+
+# _FORTIFY_SOURCE only works with optimization enabled. Avoid a preprocessor
+# warning (and thus -Werror failures) in debug builds.
+if get_option('optimization') != '0'
+  add_project_arguments('-D_FORTIFY_SOURCE=2', language: 'c')
+endif
 
 if meson.version().version_compare('>=0.48.0')
   # https://github.com/mesonbuild/meson/issues/2166#issuecomment-629696911
@@ -88,8 +115,11 @@ cairo_dep = dependency('cairo', version: '>=1.14.4', method: 'pkg-config')
 i3lock_srcs = [
   'dpi.c',
   'i3lock.c',
+  'image.c',
+  'password.c',
   'randr.c',
   'unlock_indicator.c',
+  'util.c',
   'xcb.c',
 ]
 
@@ -136,3 +166,5 @@ install_subdir(
   strip_directory: true,
   install_dir: join_paths(get_option('sysconfdir'), 'pam.d'),
 )
+
+subdir('tests')

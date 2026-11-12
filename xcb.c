@@ -8,46 +8,27 @@
  *
  */
 #include <xcb/xcb.h>
-#include <xcb/xcb_image.h>
-#include <xcb/xcb_atom.h>
 #include <xcb/xcb_aux.h>
+#include <xcb/xcb_image.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <err.h>
 #include <time.h>
-#include <sys/time.h>
 
 #include "cursors.h"
 #include "unlock_indicator.h"
-
-extern auth_state_t auth_state;
+#include "util.h"
+#include "xcb.h"
 
 xcb_connection_t *conn;
 xcb_screen_t *screen;
 
 static xcb_atom_t _NET_WM_BYPASS_COMPOSITOR = XCB_NONE;
-void _init_net_wm_bypass_compositor(xcb_connection_t *conn) {
-    if (_NET_WM_BYPASS_COMPOSITOR != XCB_NONE) {
-        /* already initialized */
-        return;
-    }
-    xcb_generic_error_t *err;
-    xcb_intern_atom_reply_t *atom_reply = xcb_intern_atom_reply(
-        conn,
-        xcb_intern_atom(conn, 0, strlen("_NET_WM_BYPASS_COMPOSITOR"), "_NET_WM_BYPASS_COMPOSITOR"),
-        &err);
-    if (atom_reply == NULL) {
-        fprintf(stderr, "X11 Error %d\n", err->error_code);
-        free(err);
-        return;
-    }
-    _NET_WM_BYPASS_COMPOSITOR = atom_reply->atom;
-    free(atom_reply);
-}
+static xcb_atom_t _NET_ACTIVE_WINDOW = XCB_NONE;
 
 #define curs_invisible_width 8
 #define curs_invisible_height 8
@@ -73,29 +54,47 @@ static unsigned char mask_windows_bits[] = {
     0xf7, 0x00, 0xf3, 0x00, 0xe1, 0x01, 0xe0, 0x01, 0xc0, 0x03, 0xc0, 0x03,
     0x80, 0x01};
 
-static uint32_t get_colorpixel(char *hex) {
-    char strgroups[3][3] = {{hex[0], hex[1], '\0'},
-                            {hex[2], hex[3], '\0'},
-                            {hex[4], hex[5], '\0'}};
-    uint32_t rgb16[3] = {(strtol(strgroups[0], NULL, 16)),
-                         (strtol(strgroups[1], NULL, 16)),
-                         (strtol(strgroups[2], NULL, 16))};
+static bool intern_atom(xcb_connection_t *conn, const char *name, xcb_atom_t *atom) {
+    xcb_generic_error_t *error = NULL;
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(
+        conn,
+        xcb_intern_atom(conn, 0, (uint16_t)strlen(name), name),
+        &error);
 
-    return (rgb16[0] << 16) + (rgb16[1] << 8) + rgb16[2];
+    if (reply == NULL) {
+        if (error != NULL) {
+            fprintf(stderr, "X11 Error %d while interning %s\n", error->error_code, name);
+            free(error);
+        }
+        return false;
+    }
+
+    *atom = reply->atom;
+    free(reply);
+    return true;
 }
 
-xcb_visualtype_t *get_root_visual_type(xcb_screen_t *screen) {
+static uint32_t get_colorpixel(const char *hex) {
+    uint32_t pixel = 0;
+    if (!parse_hex_color(hex, &pixel)) {
+        fprintf(stderr, "Invalid color: %s\n", hex != NULL ? hex : "(null)");
+        return 0;
+    }
+    return pixel;
+}
+
+xcb_visualtype_t *get_root_visual_type(xcb_screen_t *scr) {
     xcb_visualtype_t *visual_type = NULL;
     xcb_depth_iterator_t depth_iter;
     xcb_visualtype_iterator_t visual_iter;
 
-    for (depth_iter = xcb_screen_allowed_depths_iterator(screen);
+    for (depth_iter = xcb_screen_allowed_depths_iterator(scr);
          depth_iter.rem;
          xcb_depth_next(&depth_iter)) {
         for (visual_iter = xcb_depth_visuals_iterator(depth_iter.data);
              visual_iter.rem;
              xcb_visualtype_next(&visual_iter)) {
-            if (screen->root_visual != visual_iter.data->visual_id) {
+            if (scr->root_visual != visual_iter.data->visual_id) {
                 continue;
             }
 
@@ -107,24 +106,29 @@ xcb_visualtype_t *get_root_visual_type(xcb_screen_t *screen) {
     return NULL;
 }
 
-xcb_pixmap_t create_bg_pixmap(xcb_connection_t *conn, xcb_screen_t *scr, u_int32_t *resolution, char *color) {
+xcb_pixmap_t create_bg_pixmap(xcb_connection_t *conn, xcb_screen_t *scr, const uint32_t *resolution, const char *color) {
+    if (resolution == NULL || resolution[0] == 0 || resolution[1] == 0 ||
+        resolution[0] > UINT16_MAX || resolution[1] > UINT16_MAX) {
+        return XCB_NONE;
+    }
+
     xcb_pixmap_t bg_pixmap = xcb_generate_id(conn);
     xcb_create_pixmap(conn, scr->root_depth, bg_pixmap, scr->root,
-                      resolution[0], resolution[1]);
+                      (uint16_t)resolution[0], (uint16_t)resolution[1]);
 
     /* Generate a Graphics Context and fill the pixmap with background color
      * (for images that are smaller than your screen) */
     xcb_gcontext_t gc = xcb_generate_id(conn);
     uint32_t values[] = {get_colorpixel(color)};
     xcb_create_gc(conn, gc, bg_pixmap, XCB_GC_FOREGROUND, values);
-    xcb_rectangle_t rect = {0, 0, resolution[0], resolution[1]};
+    xcb_rectangle_t rect = {0, 0, (uint16_t)resolution[0], (uint16_t)resolution[1]};
     xcb_poly_fill_rectangle(conn, bg_pixmap, gc, 1, &rect);
     xcb_free_gc(conn, gc);
 
     return bg_pixmap;
 }
 
-xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, char *color, xcb_pixmap_t pixmap) {
+xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, const char *color, xcb_pixmap_t pixmap) {
     uint32_t mask = 0;
     uint32_t values[3];
     xcb_window_t win = xcb_generate_id(conn);
@@ -167,7 +171,7 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, c
                         XCB_ATOM_WM_NAME,
                         XCB_ATOM_STRING,
                         8,
-                        strlen(name),
+                        (uint32_t)strlen(name),
                         name);
 
     xcb_change_property(conn,
@@ -176,19 +180,23 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, c
                         XCB_ATOM_WM_CLASS,
                         XCB_ATOM_STRING,
                         8,
-                        2 * (strlen("i3lock") + 1),
+                        2 * (uint32_t)(strlen("i3lock") + 1),
                         "i3lock\0i3lock\0");
 
     const uint32_t bypass_compositor = 1; /* disable compositing */
-    _init_net_wm_bypass_compositor(conn);
-    xcb_change_property(conn,
-                        XCB_PROP_MODE_REPLACE,
-                        win,
-                        _NET_WM_BYPASS_COMPOSITOR,
-                        XCB_ATOM_CARDINAL,
-                        32,
-                        1,
-                        &bypass_compositor);
+    if (_NET_WM_BYPASS_COMPOSITOR == XCB_NONE) {
+        (void)intern_atom(conn, "_NET_WM_BYPASS_COMPOSITOR", &_NET_WM_BYPASS_COMPOSITOR);
+    }
+    if (_NET_WM_BYPASS_COMPOSITOR != XCB_NONE) {
+        xcb_change_property(conn,
+                            XCB_PROP_MODE_REPLACE,
+                            win,
+                            _NET_WM_BYPASS_COMPOSITOR,
+                            XCB_ATOM_CARDINAL,
+                            32,
+                            1,
+                            &bypass_compositor);
+    }
 
     /* Map the window (= make it visible) */
     xcb_map_window(conn, win);
@@ -203,34 +211,36 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, c
     return win;
 }
 
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0.0;
+    }
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 /*
  * Repeatedly tries to grab pointer and keyboard (up to the specified number of
- * tries).
+ * tries for each device).
  *
- * Returns true if the grab succeeded, false if not.
+ * Returns true if both grabs succeeded, false if not.
  *
  */
-bool grab_pointer_and_keyboard(xcb_connection_t *conn, xcb_screen_t *screen, xcb_cursor_t cursor, int tries) {
-    xcb_grab_pointer_cookie_t pcookie;
-    xcb_grab_pointer_reply_t *preply;
-
-    xcb_grab_keyboard_cookie_t kcookie;
-    xcb_grab_keyboard_reply_t *kreply;
-
-    const suseconds_t screen_redraw_timeout = 100000; /* 100ms */
-
-    /* Using few variables to trigger a redraw_screen() if too many tries */
-    bool redrawn = false;
-    struct timeval start;
-    if (gettimeofday(&start, NULL) == -1) {
-        err(EXIT_FAILURE, "gettimeofday");
+bool grab_pointer_and_keyboard(xcb_connection_t *conn, xcb_screen_t *scr, xcb_cursor_t cursor, int tries) {
+    if (tries <= 0) {
+        return false;
     }
 
-    while (tries-- > 0) {
-        pcookie = xcb_grab_pointer(
+    const double screen_redraw_timeout = 0.1; /* 100ms */
+    bool redrawn = false;
+    const double start = monotonic_seconds();
+
+    bool pointer_grabbed = false;
+    for (int attempt = 0; attempt < tries; attempt++) {
+        xcb_grab_pointer_cookie_t pcookie = xcb_grab_pointer(
             conn,
             false,               /* get all pointer events specified by the following mask */
-            screen->root,        /* grab the root window */
+            scr->root,           /* grab the root window */
             XCB_NONE,            /* which events to let through */
             XCB_GRAB_MODE_ASYNC, /* pointer events should continue as normal */
             XCB_GRAB_MODE_ASYNC, /* keyboard mode */
@@ -238,83 +248,68 @@ bool grab_pointer_and_keyboard(xcb_connection_t *conn, xcb_screen_t *screen, xcb
             cursor,              /* we change the cursor to whatever the user wanted */
             XCB_CURRENT_TIME);
 
-        if ((preply = xcb_grab_pointer_reply(conn, pcookie, NULL)) &&
-            preply->status == XCB_GRAB_STATUS_SUCCESS) {
-            free(preply);
+        xcb_grab_pointer_reply_t *preply = xcb_grab_pointer_reply(conn, pcookie, NULL);
+        bool success = preply != NULL && preply->status == XCB_GRAB_STATUS_SUCCESS;
+        free(preply);
+
+        if (success) {
+            pointer_grabbed = true;
             break;
         }
 
-        /* In case the grab failed, we still need to free the reply */
-        free(preply);
-
-        /* Make this quite a bit slower */
+        /* Make this quite a bit slower. */
         usleep(50);
 
-        struct timeval now;
-        if (gettimeofday(&now, NULL) == -1) {
-            err(EXIT_FAILURE, "gettimeofday");
-        }
-
-        struct timeval elapsed;
-        timersub(&now, &start, &elapsed);
-
-        if (!redrawn &&
-            (tries % 100) == 0 &&
-            elapsed.tv_usec >= screen_redraw_timeout) {
+        if (!redrawn && (monotonic_seconds() - start) >= screen_redraw_timeout) {
             redraw_screen();
             redrawn = true;
         }
     }
 
-    while (tries-- > 0) {
-        kcookie = xcb_grab_keyboard(
+    if (!pointer_grabbed) {
+        return false;
+    }
+
+    bool keyboard_grabbed = false;
+    for (int attempt = 0; attempt < tries; attempt++) {
+        xcb_grab_keyboard_cookie_t kcookie = xcb_grab_keyboard(
             conn,
-            true,         /* report events */
-            screen->root, /* grab the root window */
+            true,      /* report events */
+            scr->root, /* grab the root window */
             XCB_CURRENT_TIME,
             XCB_GRAB_MODE_ASYNC, /* process events as normal, do not require sync */
             XCB_GRAB_MODE_ASYNC);
 
-        if ((kreply = xcb_grab_keyboard_reply(conn, kcookie, NULL)) &&
-            kreply->status == XCB_GRAB_STATUS_SUCCESS) {
-            free(kreply);
+        xcb_grab_keyboard_reply_t *kreply = xcb_grab_keyboard_reply(conn, kcookie, NULL);
+        bool success = kreply != NULL && kreply->status == XCB_GRAB_STATUS_SUCCESS;
+        free(kreply);
+
+        if (success) {
+            keyboard_grabbed = true;
             break;
         }
 
-        /* In case the grab failed, we still need to free the reply */
-        free(kreply);
-
-        /* Make this quite a bit slower */
+        /* Make this quite a bit slower. */
         usleep(50);
 
-        struct timeval now;
-        if (gettimeofday(&now, NULL) == -1) {
-            err(EXIT_FAILURE, "gettimeofday");
-        }
-
-        struct timeval elapsed;
-        timersub(&now, &start, &elapsed);
-
-        /* Trigger a screen redraw if 100ms elapsed */
-        if (!redrawn &&
-            (tries % 100) == 0 &&
-            elapsed.tv_usec >= screen_redraw_timeout) {
+        if (!redrawn && (monotonic_seconds() - start) >= screen_redraw_timeout) {
             redraw_screen();
             redrawn = true;
         }
     }
 
-    return (tries > 0);
+    return keyboard_grabbed;
 }
 
-xcb_cursor_t create_cursor(xcb_connection_t *conn, xcb_screen_t *screen, xcb_window_t win, int choice) {
+xcb_cursor_t create_cursor(xcb_connection_t *conn, xcb_screen_t *scr, xcb_window_t win, int choice) {
     xcb_pixmap_t bitmap;
     xcb_pixmap_t mask;
     xcb_cursor_t cursor;
 
     unsigned char *curs_bits;
     unsigned char *mask_bits;
-    int curs_w, curs_h;
+    int curs_w;
+    int curs_h;
 
     switch (choice) {
         case CURS_NONE:
@@ -340,8 +335,8 @@ xcb_cursor_t create_cursor(xcb_connection_t *conn, xcb_screen_t *screen, xcb_win
                                                 curs_w,
                                                 curs_h,
                                                 1,
-                                                screen->white_pixel,
-                                                screen->black_pixel,
+                                                scr->white_pixel,
+                                                scr->black_pixel,
                                                 NULL);
 
     mask = xcb_create_pixmap_from_bitmap_data(conn,
@@ -350,8 +345,8 @@ xcb_cursor_t create_cursor(xcb_connection_t *conn, xcb_screen_t *screen, xcb_win
                                               curs_w,
                                               curs_h,
                                               1,
-                                              screen->white_pixel,
-                                              screen->black_pixel,
+                                              scr->white_pixel,
+                                              scr->black_pixel,
                                               NULL);
 
     cursor = xcb_generate_id(conn);
@@ -370,30 +365,21 @@ xcb_cursor_t create_cursor(xcb_connection_t *conn, xcb_screen_t *screen, xcb_win
     return cursor;
 }
 
-static xcb_atom_t _NET_ACTIVE_WINDOW = XCB_NONE;
-void _init_net_active_window(xcb_connection_t *conn) {
+static void _init_net_active_window(xcb_connection_t *conn) {
     if (_NET_ACTIVE_WINDOW != XCB_NONE) {
         /* already initialized */
         return;
     }
-    xcb_generic_error_t *err;
-    xcb_intern_atom_reply_t *atom_reply = xcb_intern_atom_reply(
-        conn,
-        xcb_intern_atom(conn, 0, strlen("_NET_ACTIVE_WINDOW"), "_NET_ACTIVE_WINDOW"),
-        &err);
-    if (atom_reply == NULL) {
-        fprintf(stderr, "X11 Error %d\n", err->error_code);
-        free(err);
-        return;
-    }
-    _NET_ACTIVE_WINDOW = atom_reply->atom;
-    free(atom_reply);
+    (void)intern_atom(conn, "_NET_ACTIVE_WINDOW", &_NET_ACTIVE_WINDOW);
 }
 
 xcb_window_t find_focused_window(xcb_connection_t *conn, const xcb_window_t root) {
     xcb_window_t result = XCB_NONE;
 
     _init_net_active_window(conn);
+    if (_NET_ACTIVE_WINDOW == XCB_NONE) {
+        return XCB_NONE;
+    }
 
     xcb_get_property_reply_t *prop_reply = xcb_get_property_reply(
         conn,
@@ -403,7 +389,7 @@ xcb_window_t find_focused_window(xcb_connection_t *conn, const xcb_window_t root
     if (prop_reply == NULL) {
         goto out;
     }
-    if (xcb_get_property_value_length(prop_reply) == 0) {
+    if (xcb_get_property_value_length(prop_reply) < (int)sizeof(xcb_window_t)) {
         goto out_prop;
     }
     if (prop_reply->type != XCB_ATOM_WINDOW) {
@@ -419,10 +405,13 @@ out:
 }
 
 void set_focused_window(xcb_connection_t *conn, const xcb_window_t root, const xcb_window_t window) {
+    _init_net_active_window(conn);
+    if (_NET_ACTIVE_WINDOW == XCB_NONE) {
+        return;
+    }
+
     xcb_client_message_event_t ev;
     memset(&ev, '\0', sizeof(xcb_client_message_event_t));
-
-    _init_net_active_window(conn);
 
     ev.response_type = XCB_CLIENT_MESSAGE;
     ev.window = window;

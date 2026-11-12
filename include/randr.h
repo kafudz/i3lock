@@ -1,5 +1,8 @@
-#ifndef _XINERAMA_H
-#define _XINERAMA_H
+#ifndef _RANDR_H
+#define _RANDR_H
+
+#include <stdint.h>
+#include <xcb/xcb.h>
 
 typedef struct Rect {
     int16_t x;

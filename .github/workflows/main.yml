@@ -16,19 +16,20 @@ jobs:
       CC: ${{ matrix.compiler }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - run: git fetch --prune --unshallow
     - name: fetch or build Docker container
       run: |
         docker build --pull --no-cache --rm -t=i3lock -f ci/Dockerfile .
-        docker run -e CC -v $PWD:/usr/src:rw i3lock /bin/sh -c 'git config --global --add safe.directory /usr/src && mkdir build && cd build && CFLAGS="-Wformat -Wformat-security -Wextra -Wno-unused-parameter -Werror" meson .. && ninja'
+        docker run -e CC -v $PWD:/usr/src:rw i3lock /bin/sh -c 'git config --global --add safe.directory /usr/src && mkdir build && cd build && CFLAGS="-Wformat -Wformat-security -Wextra -Wno-unused-parameter -Werror" meson .. && ninja && meson test --print-errorlogs'
   formatting:
     name: Check formatting
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Install dependencies
       run: |
+        sudo apt-get update
         sudo apt-get install -y clang-format-15
     - name: Check formatting
       run: clang-format-15 --dry-run --Werror $(git ls-files '*.c' 'include/*.h')

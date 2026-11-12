@@ -29,50 +29,9 @@ static bool has_randr = false;
 static bool has_randr_1_5 = false;
 extern bool debug_mode;
 
-void _xinerama_init(void);
-
-void randr_init(int *event_base, xcb_window_t root) {
-    const xcb_query_extension_reply_t *extreply;
-
-    extreply = xcb_get_extension_data(conn, &xcb_randr_id);
-    if (!extreply->present) {
-        DEBUG("RandR is not present, falling back to Xinerama.\n");
-        _xinerama_init();
-        return;
-    }
-
-    xcb_generic_error_t *err;
-    xcb_randr_query_version_reply_t *randr_version =
-        xcb_randr_query_version_reply(
-            conn, xcb_randr_query_version(conn, XCB_RANDR_MAJOR_VERSION, XCB_RANDR_MINOR_VERSION), &err);
-    if (err != NULL) {
-        DEBUG("Could not query RandR version: X11 error code %d\n", err->error_code);
-        _xinerama_init();
-        return;
-    }
-
-    has_randr = true;
-
-    has_randr_1_5 = (randr_version->major_version >= 1) &&
-                    (randr_version->minor_version >= 5);
-
-    free(randr_version);
-
-    if (event_base != NULL) {
-        *event_base = extreply->first_event;
-    }
-
-    xcb_randr_select_input(conn, root,
-                           XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE |
-                               XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE |
-                               XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE |
-                               XCB_RANDR_NOTIFY_MASK_OUTPUT_PROPERTY);
-
-    xcb_flush(conn);
-}
-
-void _xinerama_init(void) {
-    if (!xcb_get_extension_data(conn, &xcb_xinerama_id)->present) {
+static void _xinerama_init(void) {
+    const xcb_query_extension_reply_t *extreply = xcb_get_extension_data(conn, &xcb_xinerama_id);
+    if (extreply == NULL || !extreply->present) {
         DEBUG("Xinerama extension not found, disabling.\n");
         return;
     }
@@ -95,6 +54,50 @@ void _xinerama_init(void) {
     free(reply);
 }
 
+void randr_init(int *event_base, xcb_window_t root) {
+    const xcb_query_extension_reply_t *extreply;
+
+    extreply = xcb_get_extension_data(conn, &xcb_randr_id);
+    if (extreply == NULL || !extreply->present) {
+        DEBUG("RandR is not present, falling back to Xinerama.\n");
+        _xinerama_init();
+        return;
+    }
+
+    xcb_generic_error_t *err = NULL;
+    xcb_randr_query_version_reply_t *randr_version =
+        xcb_randr_query_version_reply(
+            conn, xcb_randr_query_version(conn, XCB_RANDR_MAJOR_VERSION, XCB_RANDR_MINOR_VERSION), &err);
+    if (err != NULL || randr_version == NULL) {
+        if (err != NULL) {
+            DEBUG("Could not query RandR version: X11 error code %d\n", err->error_code);
+            free(err);
+        }
+        free(randr_version);
+        _xinerama_init();
+        return;
+    }
+
+    has_randr = true;
+
+    has_randr_1_5 = (randr_version->major_version > 1) ||
+                    (randr_version->major_version == 1 && randr_version->minor_version >= 5);
+
+    free(randr_version);
+
+    if (event_base != NULL) {
+        *event_base = extreply->first_event;
+    }
+
+    xcb_randr_select_input(conn, root,
+                           XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE |
+                               XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE |
+                               XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE |
+                               XCB_RANDR_NOTIFY_MASK_OUTPUT_PROPERTY);
+
+    xcb_flush(conn);
+}
+
 /*
  * randr_query_outputs_15 uses RandR ≥ 1.5 to update outputs.
  *
@@ -109,13 +112,16 @@ static bool _randr_query_monitors_15(xcb_window_t root) {
     }
     /* RandR 1.5 available at run-time (supported by the server) */
     DEBUG("Querying monitors using RandR 1.5\n");
-    xcb_generic_error_t *err;
+    xcb_generic_error_t *err = NULL;
     xcb_randr_get_monitors_reply_t *monitors =
         xcb_randr_get_monitors_reply(
             conn, xcb_randr_get_monitors(conn, root, true), &err);
-    if (err != NULL) {
-        DEBUG("Could not get RandR monitors: X11 error code %d\n", err->error_code);
-        free(err);
+    if (err != NULL || monitors == NULL) {
+        if (err != NULL) {
+            DEBUG("Could not get RandR monitors: X11 error code %d\n", err->error_code);
+            free(err);
+        }
+        free(monitors);
         /* Fall back to RandR ≤ 1.4 */
         return false;
     }
@@ -124,7 +130,15 @@ static bool _randr_query_monitors_15(xcb_window_t root) {
     DEBUG("%d RandR monitors found (timestamp %d)\n",
           screens, monitors->timestamp);
 
-    Rect *resolutions = malloc(screens * sizeof(Rect));
+    if (screens <= 0) {
+        free(xr_resolutions);
+        xr_resolutions = NULL;
+        xr_screens = 0;
+        free(monitors);
+        return true;
+    }
+
+    Rect *resolutions = calloc((size_t)screens, sizeof(Rect));
     /* No memory? Just keep on using the old information. */
     if (!resolutions) {
         free(monitors);
@@ -132,16 +146,16 @@ static bool _randr_query_monitors_15(xcb_window_t root) {
     }
 
     xcb_randr_monitor_info_iterator_t iter;
-    int screen;
-    for (iter = xcb_randr_get_monitors_monitors_iterator(monitors), screen = 0;
+    int monitor_index;
+    for (iter = xcb_randr_get_monitors_monitors_iterator(monitors), monitor_index = 0;
          iter.rem;
-         xcb_randr_monitor_info_next(&iter), screen++) {
+         xcb_randr_monitor_info_next(&iter), monitor_index++) {
         const xcb_randr_monitor_info_t *monitor_info = iter.data;
 
-        resolutions[screen].x = monitor_info->x;
-        resolutions[screen].y = monitor_info->y;
-        resolutions[screen].width = monitor_info->width;
-        resolutions[screen].height = monitor_info->height;
+        resolutions[monitor_index].x = monitor_info->x;
+        resolutions[monitor_index].y = monitor_info->y;
+        resolutions[monitor_index].width = monitor_info->width;
+        resolutions[monitor_index].height = monitor_info->height;
         DEBUG("found RandR monitor: %d x %d at %d x %d\n",
               monitor_info->width, monitor_info->height,
               monitor_info->x, monitor_info->y);
@@ -182,23 +196,39 @@ static bool _randr_query_outputs_14(xcb_window_t root) {
 
     const int len = xcb_randr_get_screen_resources_current_outputs_length(res);
 
+    if (len <= 0) {
+        free(xr_resolutions);
+        xr_resolutions = NULL;
+        xr_screens = 0;
+        free(res);
+        return true;
+    }
+
     /* an output is VGA-1, LVDS-1, etc. (usually physical video outputs) */
     xcb_randr_output_t *randr_outputs = xcb_randr_get_screen_resources_current_outputs(res);
 
-    /* Request information for each output */
-    xcb_randr_get_output_info_cookie_t ocookie[len];
+    /* Request information for each output. Use the heap instead of a VLA:
+     * len comes from the X server and may be arbitrarily large. */
+    xcb_randr_get_output_info_cookie_t *ocookie = calloc((size_t)len, sizeof(*ocookie));
+    if (ocookie == NULL) {
+        free(res);
+        return true;
+    }
+
     for (int i = 0; i < len; i++) {
         ocookie[i] = xcb_randr_get_output_info(conn, randr_outputs[i], cts);
     }
-    Rect *resolutions = malloc(len * sizeof(Rect));
+
+    Rect *resolutions = calloc((size_t)len, sizeof(Rect));
     /* No memory? Just keep on using the old information. */
     if (!resolutions) {
+        free(ocookie);
         free(res);
         return true;
     }
 
     /* Loop through all outputs available for this X11 screen */
-    int screen = 0;
+    int screen_count = 0;
 
     for (int i = 0; i < len; i++) {
         xcb_randr_get_output_info_reply_t *output;
@@ -221,62 +251,72 @@ static bool _randr_query_outputs_14(xcb_window_t root) {
             continue;
         }
 
-        resolutions[screen].x = crtc->x;
-        resolutions[screen].y = crtc->y;
-        resolutions[screen].width = crtc->width;
-        resolutions[screen].height = crtc->height;
+        resolutions[screen_count].x = crtc->x;
+        resolutions[screen_count].y = crtc->y;
+        resolutions[screen_count].width = crtc->width;
+        resolutions[screen_count].height = crtc->height;
 
         DEBUG("found RandR output: %d x %d at %d x %d\n",
               crtc->width, crtc->height,
               crtc->x, crtc->y);
 
-        screen++;
+        screen_count++;
 
         free(crtc);
-
         free(output);
     }
     free(xr_resolutions);
     xr_resolutions = resolutions;
-    xr_screens = screen;
+    xr_screens = screen_count;
+    free(ocookie);
     free(res);
     return true;
 }
 
-void _xinerama_query_screens(void) {
+static void _xinerama_query_screens(void) {
     if (!xinerama_active) {
         return;
     }
 
+    xcb_generic_error_t *err = NULL;
     xcb_xinerama_query_screens_cookie_t cookie;
     xcb_xinerama_query_screens_reply_t *reply;
-    xcb_xinerama_screen_info_t *screen_info;
-    xcb_generic_error_t *err;
     cookie = xcb_xinerama_query_screens_unchecked(conn);
     reply = xcb_xinerama_query_screens_reply(conn, cookie, &err);
     if (!reply) {
-        DEBUG("Couldn't get Xinerama screens: X11 error code %d\n", err->error_code);
-        free(err);
+        if (err != NULL) {
+            DEBUG("Couldn't get Xinerama screens: X11 error code %d\n", err->error_code);
+            free(err);
+        }
         return;
     }
-    screen_info = xcb_xinerama_query_screens_screen_info(reply);
-    int screens = xcb_xinerama_query_screens_screen_info_length(reply);
 
-    Rect *resolutions = malloc(screens * sizeof(Rect));
+    int screens = xcb_xinerama_query_screens_screen_info_length(reply);
+    if (screens <= 0) {
+        free(xr_resolutions);
+        xr_resolutions = NULL;
+        xr_screens = 0;
+        free(reply);
+        return;
+    }
+
+    xcb_xinerama_screen_info_t *screen_info = xcb_xinerama_query_screens_screen_info(reply);
+
+    Rect *resolutions = calloc((size_t)screens, sizeof(Rect));
     /* No memory? Just keep on using the old information. */
     if (!resolutions) {
         free(reply);
         return;
     }
 
-    for (int screen = 0; screen < xr_screens; screen++) {
-        resolutions[screen].x = screen_info[screen].x_org;
-        resolutions[screen].y = screen_info[screen].y_org;
-        resolutions[screen].width = screen_info[screen].width;
-        resolutions[screen].height = screen_info[screen].height;
+    for (int i = 0; i < screens; i++) {
+        resolutions[i].x = screen_info[i].x_org;
+        resolutions[i].y = screen_info[i].y_org;
+        resolutions[i].width = screen_info[i].width;
+        resolutions[i].height = screen_info[i].height;
         DEBUG("found Xinerama screen: %d x %d at %d x %d\n",
-              screen_info[screen].width, screen_info[screen].height,
-              screen_info[screen].x_org, screen_info[screen].y_org);
+              screen_info[i].width, screen_info[i].height,
+              screen_info[i].x_org, screen_info[i].y_org);
     }
 
     free(xr_resolutions);

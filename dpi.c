@@ -7,6 +7,7 @@
  */
 #include "dpi.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,14 +15,32 @@
 #include "xcb.h"
 #include "i3lock.h"
 
+#define DPI_FALLBACK 96
+#define DPI_MIN 1
+#define DPI_MAX 1000
+
 extern bool debug_mode;
 
 static long dpi;
 
 extern xcb_screen_t *screen;
 
+static long clamp_dpi(double value) {
+    if (!isfinite(value) || value < DPI_MIN) {
+        return DPI_MIN;
+    }
+    if (value > DPI_MAX) {
+        return DPI_MAX;
+    }
+    return lround(value);
+}
+
 static long init_dpi_fallback(void) {
-    return (double)screen->height_in_pixels * 25.4 / (double)screen->height_in_millimeters;
+    if (screen == NULL || screen->height_in_millimeters == 0) {
+        return DPI_FALLBACK;
+    }
+    double value = (double)screen->height_in_pixels * 25.4 / (double)screen->height_in_millimeters;
+    return clamp_dpi(value);
 }
 
 /*
@@ -49,14 +68,15 @@ void init_dpi(void) {
         goto init_dpi_end;
     }
 
-    char *endptr;
+    char *endptr = NULL;
+    errno = 0;
     double in_dpi = strtod(resource, &endptr);
-    if (in_dpi == HUGE_VAL || in_dpi < 0 || *endptr != '\0' || endptr == resource) {
+    if (errno == ERANGE || !isfinite(in_dpi) || in_dpi <= 0 || *endptr != '\0' || endptr == resource) {
         DEBUG("Xft.dpi = %s is an invalid number and couldn't be parsed.\n", resource);
         dpi = 0;
         goto init_dpi_end;
     }
-    dpi = (long)round(in_dpi);
+    dpi = clamp_dpi(in_dpi);
 
     DEBUG("Found Xft.dpi = %ld.\n", dpi);
 
@@ -81,7 +101,7 @@ init_dpi_end:
  *
  */
 long get_dpi_value(void) {
-    return dpi;
+    return dpi > 0 ? dpi : DPI_FALLBACK;
 }
 
 /*
@@ -97,14 +117,16 @@ int logical_px(const int logical) {
         return logical;
     }
 
+    long current_dpi = get_dpi_value();
+
     /* There are many misconfigurations out there, i.e. systems with screens
      * whose dpi is in fact higher than 96 dpi, but not significantly higher,
      * so software was never adapted. We could tell people to reconfigure their
      * systems to 96 dpi in order to get the behavior they expect/are used to,
      * but since we can easily detect this case in code, let’s do it for them.
      */
-    if ((dpi / 96.0) < 1.25) {
+    if ((current_dpi / 96.0) < 1.25) {
         return logical;
     }
-    return ceil((dpi / 96.0) * logical);
+    return ceil((current_dpi / 96.0) * logical);
 }

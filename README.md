@@ -71,6 +71,7 @@ mkdir -p build && cd build/
 
 meson setup -Dprefix=/usr
 ninja
+meson test
 ```
 
 Upstream

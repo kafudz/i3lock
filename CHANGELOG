@@ -1,3 +1,17 @@
+UNRELEASED
+
+ • fix a potential password buffer overflow when appending composed
+   characters
+ • wipe the complete password buffer, including stale data after
+   backspaces
+ • keep the screen locked if fork(2) fails while daemonizing
+ • fix out-of-bounds access in the Xinerama screen query and avoid a
+   server-controlled stack allocation in the RandR query
+ • validate raw image dimensions and use overflow-checked arithmetic
+ • avoid re-rendering the background image on every keypress
+ • harden the build with stack protector, PIE, RELRO and FORTIFY_SOURCE
+ • add unit tests for the utility and password modules
+
 2025-10-31 i3lock 2.16
 
  • fix crash when the user changes the XKB configuration
