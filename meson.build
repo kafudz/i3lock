@@ -44,8 +44,9 @@ add_project_link_arguments(cc.get_supported_link_arguments([
 ]), language: 'c')
 
 # _FORTIFY_SOURCE only works with optimization enabled. Avoid a preprocessor
-# warning (and thus -Werror failures) in debug builds.
-if get_option('optimization') != '0'
+# warning (and thus -Werror failures) in debug builds, and do not override a
+# definition supplied by the distribution (e.g. -Wp,-D_FORTIFY_SOURCE=3).
+if get_option('optimization') != '0' and cc.get_define('_FORTIFY_SOURCE') == ''
   add_project_arguments('-D_FORTIFY_SOURCE=2', language: 'c')
 endif
 

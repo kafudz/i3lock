@@ -127,6 +127,9 @@ All ten steps are implemented.
   surface allocation and reading.
 - `tests/meson.build`, `tests/test_util.c`, `tests/test_password.c`,
   `tests/test_image.c` — unit tests.
+- `PKGBUILD` — Arch `i3lock-git` package tracking
+  `https://github.com/kafudz/i3lock`, using a release build and
+  `options=('!debug')`.
 
 ### Modified files
 
@@ -143,7 +146,8 @@ All ten steps are implemented.
 - `include/xcb.h`, `include/randr.h`, `include/unlock_indicator.h`,
   `include/i3lock.h` — updated prototypes and removed stale declarations.
 - `meson.build` — new sources, hardening flags, `HAVE_EXPLICIT_BZERO`, tests
-  subdir, Meson minimum `>=0.46.0`.
+  subdir, Meson minimum `>=0.46.0`; `_FORTIFY_SOURCE` is only added when the
+  distribution has not already defined it.
 - `.github/workflows/main.yml` — run `meson test --print-errorlogs`.
 - `README.md` — document `meson test`.
 - `CHANGELOG` — record the fixes.
@@ -218,7 +222,7 @@ The CI-equivalent build completes with no warnings under
 ## 7. Complete updated file contents
 
 The following sections contain the complete current contents of every new or
-modified source, header, build, test, CI, and documentation file.
+modified source, header, build, test, CI, packaging, and documentation file.
 
 ### `i3lock.c`
 
@@ -3592,8 +3596,9 @@ add_project_link_arguments(cc.get_supported_link_arguments([
 ]), language: 'c')
 
 # _FORTIFY_SOURCE only works with optimization enabled. Avoid a preprocessor
-# warning (and thus -Werror failures) in debug builds.
-if get_option('optimization') != '0'
+# warning (and thus -Werror failures) in debug builds, and do not override a
+# definition supplied by the distribution (e.g. -Wp,-D_FORTIFY_SOURCE=3).
+if get_option('optimization') != '0' and cc.get_define('_FORTIFY_SOURCE') == ''
   add_project_arguments('-D_FORTIFY_SOURCE=2', language: 'c')
 endif
 
@@ -3995,6 +4000,65 @@ jobs:
         sudo apt-get install -y clang-format-15
     - name: Check formatting
       run: clang-format-15 --dry-run --Werror $(git ls-files '*.c' 'include/*.h')
+````
+
+### `PKGBUILD`
+
+````bash
+# Maintainer: kafudz
+#
+# Tracks the kafudz/i3lock fork. The package intentionally uses a release build
+# and does not enable Arch's debug package option.
+pkgname=i3lock-git
+pkgver=2.16.r358.gfce70d0
+pkgrel=1
+pkgdesc='Improved screen locker (kafudz fork)'
+arch=('x86_64')
+url='https://github.com/kafudz/i3lock'
+license=('BSD-3-Clause')
+depends=(
+  'cairo'
+  'libev'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'pam'
+  'xcb-util'
+  'xcb-util-image'
+  'xcb-util-xrm'
+)
+makedepends=('git' 'meson' 'ninja')
+provides=('i3lock')
+conflicts=('i3lock')
+options=('!debug')
+source=("$pkgname::git+https://github.com/kafudz/i3lock.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  local _ver
+  _ver=$(sed -n "s/^  version: '\([^']*\)',/\1/p" meson.build)
+  printf '%s.r%s.g%s' "$_ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$pkgname"
+  meson setup build \
+    --prefix=/usr \
+    --buildtype=release \
+    --wrap-mode=nodownload
+  ninja -C build
+}
+
+check() {
+  cd "$pkgname"
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  cd "$pkgname"
+  DESTDIR="$pkgdir" meson install -C build
+}
 ````
 
 ### `README.md`
